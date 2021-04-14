@@ -1,0 +1,179 @@
+---
+title: "ChurnRate"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(InformationValue)
+library(ggplot2)
+library(caTools)
+library(caret)
+library(e1071)
+library(ROSE)
+library(xgboost)
+setwd("~/Documents/DS/CodeSignal")
+```
+
+## Calculate Churn rate
+
+a) Calculate the churn rate 
+```{r Data Preparation, echo = FALSE}
+feature <- read.csv('features_data.csv')
+equity <- fread("equity_value_data.csv", stringsAsFactors = FALSE)
+
+equity <- equity[order(user_id, timestamp), ]
+equity <- equity[!duplicated(equity), ]
+equity[, timestamp := as.Date(timestamp)]
+
+## percentage of users have churned
+## Filter the users whose balance ever fall below 10 and fin dthe churned users in the subset
+equity_lt10_users <- unique(equity[close_equity <= 10, ]$user_id)
+equity_sub <- equity[user_id %in% equity_lt10_users, ]
+equity_sub <- equity_sub[order(user_id, timestamp), ]
+
+churn <- NULL
+for (id in equity_lt10_users) {
+  tmp <- equity_sub[user_id==id,]
+  tmp <- tmp[order(timestamp), ]
+  index <- 0
+  for (i in (1:nrow(tmp))) {
+     if (index==28) {
+      churn <- c(churn,id)
+      break
+    }
+    if (tmp[i]$close_equity<=10) {
+      index <- index+1 
+    } else {
+      index <- 0
+    }
+  }
+}
+
+churn_rate <- length(churn)/length(unique(equity$user_id))
+print(paste("The calculated churn rate is", churn_rate))
+```
+
+## Data Preparation
+
+```{r Data Exploration and Preparation, echo=FALSE}
+feature <- data.table(feature)
+feature[, churn := ifelse(user_id %in% churn, 1, 0)]
+##Numerics variables 
+numerics <- c("time_spent", "first_deposit_amount")
+####
+vars <- c(numerics)
+for (i in vars) {
+p <- ggplot(data=feature, aes(x=eval(parse(text = i)))) + 
+  geom_histogram(col="red", 
+                 fill="green", 
+                 alpha = .2) + 
+  labs(title= paste("Histogram for ", i))
+print(p)
+}
+### The distribution is skewed to the right; Use Winsorization to address the issue
+summary(feature[, list(time_spent, first_deposit_amount)])
+q <- 0.99
+tmax <- quantile(feature$time_spent, q)
+dmax <- quantile(feature$first_deposit_amount, q)
+feature[, time_spent := ifelse(time_spent > tmax, tmax, time_spent)]
+feature[, first_deposit_amount := ifelse(first_deposit_amount > dmax, dmax, first_deposit_amount)]
+
+for (i in vars) {
+p <- ggplot(data=feature, aes(x=eval(parse(text = i)))) + 
+  geom_histogram(col="red", 
+                 fill="green", 
+                 alpha = .2) + 
+  labs(title= paste("Histogram for ", i))
+print(p)
+}
+
+###Normalize the numeric variables (minmax scaler)
+tmin <- min(feature$time_spent, na.rm =T)
+tmax <- max(feature$time_spent, na.rm =T)
+dmin <- min(feature$first_deposit_amount, na.rm =T)
+dmax <- max(feature$first_deposit_amount, na.rm =T)
+feature[, time_spent := (time_spent - tmin)/(tmax - tmin)]
+feature[, first_deposit_amount :=  (first_deposit_amount - dmin)/(dmax - dmin)]
+
+###Investigate the Nonnumeric features
+nonnumerics <- c("risk_tolerance", "investment_experience", "liquidity_needs", "platform", "instrument_type_first_traded", "time_horizon")
+feature[, (nonnumerics) := lapply(.SD, factor), .SDcols = nonnumerics]
+for (i in nonnumerics) {
+b <- ggplot(data = feature, aes(x = eval(parse(text = i)))) +
+    geom_bar() +
+   labs(title= paste("Frequency for ", i))
+print(b)}
+
+```
+
+
+## Modeling 
+b)Build a Xgboost model to predict the churn probability
+Since the data is highly imbalanced, adjust the weights of the churn = 1 class
+The model performace metrics used here include AUROC, confusion matrix (sensitivity, specificity etc), kolmogorov-smirnov statistic. All the statistics suggest the model performs reasonably well.
+c)Find the most importance features using feature importance analysis:
+The top 5 are: 
+first_deposit_amount
+time_spent
+investment_experience
+instrument_type_first_traded
+time_horizon
+
+```{r Modeling, echo=FALSE}
+feature$user_id <- NULL
+feature <- feature[, c("churn", numerics, nonnumerics), with = FALSE]
+feature[, churn := as.factor(as.character(churn))]
+
+##Split the dataset into training and testing to train models
+set.seed(123)
+sample <- sample.split(feature$churn, SplitRatio = 0.7)
+train <- subset(feature, sample == TRUE)
+# table(train$churn)
+test<- subset(feature, sample == FALSE)
+# table(test$churn)
+
+##BConvert to matrix format
+new_tr <- model.matrix(~.+0,data = train[,-c("churn"),with=F]) 
+new_ts <- model.matrix(~.+0,data = test[,-c("churn"),with=F])
+#convert factor to numeric 
+labels <- as.numeric(train$churn)-1
+ts_label <- as.numeric(test$churn)-1
+# table(labels)
+# table(ts_label)
+dtrain <- xgb.DMatrix(data = new_tr, label = labels) 
+dtest <- xgb.DMatrix(data = new_ts, label=ts_label)
+
+params <- list(max_depth = 6, eta = 0.1, scale_pos_weight = length(train[churn == 0, ]$churn)/length(train[churn == 1, ]$churn), eval_metric = "auc")
+
+model.xgb <-
+  xgboost(
+    params = params,
+    data = dtrain,
+    nrounds = 2000,
+    objective = "binary:logistic",
+    early_stopping_rounds = 3,
+    verbose = 0
+  )  
+
+xgbprob <- predict(model.xgb,dtest, type = "response")
+###Model Performance Metrics
+print(paste("The following performance metrics are also related: "))
+
+xgbpred <- as.numeric(xgbprob > 0.5)
+caret::confusionMatrix(as.factor(as.character(xgbpred)), test$churn)
+plotROC(actuals=test$churn, predictedScores=xgbpred)
+
+print(paste("kolmogorov-smirnov statistic =", ks_stat(test$churn, xgbprob)))
+ks_plot(test$churn, xgbprob)
+
+
+###Feature Importance
+importanceRaw <-xgb.importance(model = model.xgb)
+importanceClean <- importanceRaw[,`:=`(Cover=NULL, Frequency=NULL)]
+xgb.plot.importance(importance_matrix = importanceRaw)
+
+```
+
+
