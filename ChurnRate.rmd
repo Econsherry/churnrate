@@ -13,7 +13,7 @@ library(caret)
 library(e1071)
 library(ROSE)
 library(xgboost)
-setwd("~/Documents/DS/CodeSignal")
+
 ```
 
 ## Calculate Churn rate
